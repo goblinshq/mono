@@ -39,12 +39,15 @@ const options = {
   reset: v.boolean().default(true),
   cacheURL: v.string().optional(),
   cacheURLs: v.string().optional(),
+  appServerPort: v.number().default(3_000),
 
   topology: v.literalUnion('single', 'distributed').default('single'),
   numViewSyncers: v.number().default(1),
   numSyncWorkers: v.number().optional(),
   profileRM: v.boolean().default(false),
   profileVS: v.boolean().default(false),
+  profileDurationSec: v.number().default(5),
+  adminPassword: v.string().optional(),
 
   pg: {
     url: v.string().optional(),
@@ -95,8 +98,11 @@ export type BenchmarkConfig = {
   readonly profileDir: string;
   readonly profileRM: boolean;
   readonly profileVS: boolean;
+  readonly profileDurationSec: number;
+  readonly adminPassword?: string | undefined;
   readonly processLogMode: 'file' | 'inherit' | 'ignore';
   readonly reset: boolean;
+  readonly appServerPort: number;
   readonly cacheURL: string;
   readonly cacheURLs: readonly string[];
   readonly pg: {
@@ -194,8 +200,14 @@ export function loadConfig(): BenchmarkConfig {
     profileDir: parsed.profileDir,
     profileRM: parsed.profileRM,
     profileVS: parsed.profileVS,
+    profileDurationSec: parsed.profileDurationSec,
+    adminPassword:
+      parsed.adminPassword ??
+      process.env.ZERO_ADMIN_PASSWORD ??
+      process.env.ADMIN_PASSWORD,
     processLogMode: parsed.processLogMode,
     reset: parsed.reset,
+    appServerPort: parsed.appServerPort,
     cacheURL: cacheURLs[0],
     cacheURLs,
     pg: {
