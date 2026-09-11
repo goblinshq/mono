@@ -657,10 +657,25 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
   }
 
   readyState(): Promise<'initialized' | 'draining'> {
-    return Promise.race([
-      this.#initialized.promise,
-      this.#drainCoordinator.draining,
-    ]);
+    return new Promise((resolve, reject) => {
+      // Subscribe to the drain rather than racing against a Promise for it:
+      // the coordinator outlives every view-syncer, and a race reaction on a
+      // promise that may never settle would keep this closure alive for the
+      // lifetime of the server. Unsubscribe once initialization settles.
+      const unsubscribe = this.#drainCoordinator.onDraining(() =>
+        resolve('draining'),
+      );
+      this.#initialized.promise.then(
+        state => {
+          unsubscribe();
+          resolve(state);
+        },
+        err => {
+          unsubscribe();
+          reject(err);
+        },
+      );
+    });
   }
 
   async run(): Promise<void> {
@@ -1969,8 +1984,10 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
       hydrationPassStats.activeHydratedQueries++;
       this.#hydrations.add(1);
       this.#hydrationTime.recordMs(elapsed);
-      this.#addQueryMaterializationServerMetric(transformationHash, elapsed);
-      this.#inspectorDelegate.addQuery(transformationHash, transformedAst);
+      // Keyed by query id like the other hydration path: the inspector looks
+      // metrics and ASTs up by query id, and removeQuery() is keyed by it too.
+      this.#addQueryMaterializationServerMetric(queryID, elapsed);
+      this.#inspectorDelegate.addQuery(queryID, transformedAst);
       lc.debug?.(`hydrated ${count} rows for ${queryID} (${elapsed} ms)`);
 
       let drifted = false;
@@ -3340,6 +3357,7 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
       client,
       this.#inspectorDelegate,
       this.id,
+      this,
       this.#cvrStore,
       this.#config,
       connCtx,
@@ -3512,6 +3530,16 @@ export class ViewSyncerService implements ViewSyncer, ActivityBasedService {
     // cleaning up the pipelines and closing db connections.
     await this.#lock.withLock(() => {});
     this.#pipelines.destroy();
+
+    // Inspector authentication is tracked per client group in a map that
+    // outlives this service. Release the entry this service established so
+    // that the map does not grow with every client group ever served by the
+    // worker. This runs after the lock barrier above so that an
+    // `authenticate` request that was already in flight on the lock cannot
+    // re-add the entry afterwards. Passing `this` leaves an entry alone if a
+    // replacement service for the same client group has authenticated in the
+    // meantime.
+    this.#inspectorDelegate.clearAuthenticated(this.id, this);
   }
 
   /**
