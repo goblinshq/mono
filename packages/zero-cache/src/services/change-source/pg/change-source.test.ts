@@ -82,6 +82,7 @@ test('a non-transactional foreign-shard message does not interrupt a running bac
       publications: ['zero_pub'],
       initialSchema: {},
     } as unknown as Replica,
+    170000, // pgVersion (PG 17)
     {backupPath: null, backupV5: false} as unknown as BackupOptions,
     {} as ServerContext,
     0, // lagReportIntervalMs: no LagReporter
@@ -214,7 +215,7 @@ test('acker', () => {
     expect(sink.push).toBeCalledTimes(acks);
   };
 
-  const acker = new Acker(sink);
+  const acker = new Acker(sink, null);
 
   acker.onChange(['status', {ack: false}, {watermark: '0a'}]);
   expectAck(10n);
@@ -250,28 +251,48 @@ test('acker', () => {
   expectAck(17n);
 });
 
+// A stream resumes from the change-streamer's change log, which can be ahead of
+// what it has persisted durably (its backup). Until the change-streamer acks
+// the resume watermark, a keepalive past it is not acked: the slot would move
+// past transactions that a task restored from that backup still needs.
+test('acker waits for the resume watermark before acking keepalives', () => {
+  const sink = {push: vi.fn()};
+  const acker = new Acker(sink, '0c');
+
+  acker.onChange(['status', {ack: false}, {watermark: '0d'}]);
+  expect(sink.push).not.toHaveBeenCalled();
+
+  // The backup is behind the resume watermark: acked, but still waiting.
+  acker.ack('0a');
+  expect(sink.push).toHaveBeenLastCalledWith(10n);
+  acker.onChange(['status', {ack: false}, {watermark: '0e'}]);
+  expect(sink.push).toHaveBeenCalledTimes(1);
+
+  acker.ack('0c');
+  expect(sink.push).toHaveBeenLastCalledWith(12n);
+  acker.onChange(['status', {ack: false}, {watermark: '0f'}]);
+  expect(sink.push).toHaveBeenLastCalledWith(15n);
+});
+
 test('lag reporter retries missing reports', async () => {
   vi.useFakeTimers();
   vi.setSystemTime(1_000);
 
-  const dbMock = vi.fn((strings: TemplateStringsArray) => {
-    if (strings.join('').includes('current_setting')) {
-      return [{pgVersion: 170000}];
-    }
-
-    return [
-      {
-        commitTimeMs: Date.now(),
-        lsn: `0/${dbMock.mock.calls.length.toString(16)}`,
-      },
-    ];
-  });
+  // pgVersion is now supplied to the LagReporter constructor, so it no longer
+  // queries current_setting; every call is an emit-message report.
+  const dbMock = vi.fn(() => [
+    {
+      commitTimeMs: Date.now(),
+      lsn: `0/${dbMock.mock.calls.length.toString(16)}`,
+    },
+  ]);
   const db = dbMock as unknown as PostgresDB;
 
   const reporter = new LagReporter(
     createSilentLogContext(),
     {appID: 'test', shardNum: 0},
     db,
+    170000, // pgVersion (PG 17)
     10,
   );
 
@@ -280,16 +301,16 @@ test('lag reporter retries missing reports', async () => {
       firstCommitTimeMs: 1_000,
       nextSendTimeMs: 1_000,
     });
-    expect(dbMock).toHaveBeenCalledTimes(2);
+    expect(dbMock).toHaveBeenCalledTimes(1);
 
     await vi.advanceTimersByTimeAsync(9);
-    expect(dbMock).toHaveBeenCalledTimes(2);
+    expect(dbMock).toHaveBeenCalledTimes(1);
 
     await vi.advanceTimersByTimeAsync(1);
-    expect(dbMock).toHaveBeenCalledTimes(3);
+    expect(dbMock).toHaveBeenCalledTimes(2);
 
     await vi.advanceTimersByTimeAsync(10);
-    expect(dbMock).toHaveBeenCalledTimes(4);
+    expect(dbMock).toHaveBeenCalledTimes(3);
   } finally {
     reporter.stop();
     vi.useRealTimers();
